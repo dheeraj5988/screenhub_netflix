@@ -1,0 +1,13 @@
+{
+  "name": "ScreenHub Admin",
+  "short_name": "ScreenHub Admin",
+  "description": "ScreenHub Digital Services: customers, Netflix cookies and TV logins",
+  "start_url": "/admin",
+  "scope": "/admin",
+  "display": "standalone",
+  "background_color": "#141414",
+  "theme_color": "#141414",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
