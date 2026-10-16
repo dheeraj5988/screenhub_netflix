@@ -2,7 +2,7 @@
  * App version, shown in the admin header so you can see which build is live.
  * Bump it whenever you ship a change you want to be able to confirm.
  */
-export const APP_VERSION = '1.0';
+export const APP_VERSION = '1.1';
 
 export interface BuildInfo {
   version: string;

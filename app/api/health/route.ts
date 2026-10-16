@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { buildInfo } from '@/lib/version';
+import { gmailUser, gmailPassword } from '@/lib/services/gmailService';
 
 export const dynamic = 'force-dynamic';
 
@@ -43,6 +44,8 @@ export async function GET() {
     ADMIN_PASSWORD: Boolean(process.env.ADMIN_PASSWORD),
     ADMIN_SESSION_SECRET: Boolean(process.env.ADMIN_SESSION_SECRET),
     CRON_SECRET: Boolean(process.env.CRON_SECRET),
+    GMAIL_USER: Boolean(gmailUser()),
+    GMAIL_APP_PASSWORD: Boolean(gmailPassword()),
   };
 
   if (!url || !serviceKey) {

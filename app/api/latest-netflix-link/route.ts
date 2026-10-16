@@ -118,6 +118,7 @@ async function findLink(minutesAgo: number): Promise<NextResponse> {
     console.error('❌ Error fetching Netflix link:', error);
 
     if (error.message?.includes('GMAIL_USER') || error.message?.includes('GMAIL_APP_PASSWORD')) {
+      // Shown to the customer and logged in the admin activity view.
       return NextResponse.json(
         {
           success: false,
@@ -133,7 +134,7 @@ async function findLink(minutesAgo: number): Promise<NextResponse> {
         {
           success: false,
           error: 'Gmail authentication failed',
-          message: 'Please check your Gmail credentials in environment variables',
+          message: 'Gmail rejected the login: check GMAIL_USER and that GMAIL_APP_PASSWORD is a 16-character App Password (not your normal password), then Redeploy.',
         },
         { status: 401 }
       );

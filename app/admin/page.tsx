@@ -485,7 +485,7 @@ export default function AdminPage() {
           accountLabel: cookieProfileName || "Netflix Account",
           accountEmail: cookieEmail,
           cookiesRaw: cookieRawJson,
-          userAgent: cookieUserAgent || (typeof navigator !== "undefined" ? navigator.userAgent : ""),
+          userAgent: cookieUserAgent || (typeof navigator !== "undefined" && !/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? navigator.userAgent : ""),
         }),
       })
 
@@ -1300,7 +1300,7 @@ export default function AdminPage() {
                         setCookieProfileName("")
                         setCookieEmail("")
                         setCookieRawJson("")
-                        setCookieUserAgent(typeof navigator !== "undefined" ? navigator.userAgent : "")
+                        setCookieUserAgent(typeof navigator !== "undefined" && !/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? navigator.userAgent : "")
                         setCookieError("")
                         setShowAddCookieModal(true)
                       }}
@@ -1993,7 +1993,7 @@ export default function AdminPage() {
                   <label className="text-xs text-netflix-light font-medium block">Bound Device User-Agent</label>
                   <button
                     type="button"
-                    onClick={() => setCookieUserAgent(typeof navigator !== "undefined" ? navigator.userAgent : "")}
+                    onClick={() => setCookieUserAgent(typeof navigator !== "undefined" && !/Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ? navigator.userAgent : "")}
                     className="text-[11px] text-netflix-red hover:underline cursor-pointer"
                   >
                     Auto-Detect Browser
