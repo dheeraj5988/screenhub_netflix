@@ -114,6 +114,205 @@ function isLoginRedirect(res: Response): boolean {
   return res.status >= 300 && res.status < 400 && loc.includes('/login');
 }
 
+// ---------------------------------------------------------------------------
+// New Netflix code page (2026): the page is a server-driven "CLCS" screen and
+// the code is sent with a GraphQL mutation instead of a form POST.
+// ---------------------------------------------------------------------------
+
+const GRAPHQL_URL = 'https://www.netflix.com/graphql';
+/** Persisted query id of the CLCSScreenUpdate mutation in Netflix's login client. */
+const CLCS_SCREEN_UPDATE_ID = '43a29c42-1f93-4e18-80b6-97dfbb6483c6';
+const MAX_CLCS_STEPS = 3;
+
+interface ClcsAction {
+  serverScreenUpdate: string;
+  inputFieldIds: string[];
+  label: string;
+}
+
+interface ClcsScreen {
+  serverState: string;
+  viewName: string;
+  screenName: string;
+  texts: string[];
+  codeError?: string;
+  actions: ClcsAction[];
+}
+
+function isClcsPage(html: string): boolean {
+  return html.includes('"serverState":"') && html.includes('CLCSRequestScreenUpdate');
+}
+
+/** Walks a CLCS screen (parsed JSON) and collects what we need to drive it. */
+function readClcsScreen(screen: any): ClcsScreen {
+  const out: ClcsScreen = {
+    serverState: String(screen?.serverState || ''),
+    viewName: String(screen?.loggingViewName || ''),
+    screenName: '',
+    texts: [],
+    actions: [],
+  };
+  try {
+    out.screenName = JSON.parse(screen?.trackingInfo || '{}').screenName || '';
+  } catch {
+    // trackingInfo is optional
+  }
+  const seen = new Set<string>();
+  const walk = (n: any, buttonLabel: string) => {
+    if (Array.isArray(n)) return n.forEach((v) => walk(v, buttonLabel));
+    if (!n || typeof n !== 'object') return;
+    if (n.__typename === 'CLCSText' && n.plainContent?.value) out.texts.push(String(n.plainContent.value));
+    if (n.initialErrorMessage?.value && /rendezvous|code/i.test(JSON.stringify(n.inputField || n.field || ''))) {
+      out.codeError = String(n.initialErrorMessage.value);
+    }
+    const label = n.__typename === 'CLCSButton' ? String(n.label?.value || '') : buttonLabel;
+    if (n.effectType === 'CLCSRequestScreenUpdate' && n.serverScreenUpdate && !seen.has(n.serverScreenUpdate)) {
+      seen.add(n.serverScreenUpdate);
+      out.actions.push({
+        serverScreenUpdate: String(n.serverScreenUpdate),
+        inputFieldIds: (n.inputFieldRequirements || []).map((r: any) => String(r?.field?.id || '')).filter(Boolean),
+        label,
+      });
+    }
+    for (const v of Object.values(n)) walk(v, label);
+  };
+  walk(screen?.componentTree, '');
+  return out;
+}
+
+/** Reads the first screen from the page's embedded data (Netflix escapes it as a JS string). */
+function clcsScreenFromHtml(html: string): ClcsScreen | null {
+  const state = html.match(/"serverState":"([^"]+)"/)?.[1];
+  if (!state) return null;
+  const start = html.indexOf('"effectType":"CLCSRequestScreenUpdate"');
+  const actions: ClcsAction[] = [];
+  const re = /"serverScreenUpdate":"([^"]+)"/g;
+  re.lastIndex = Math.max(0, start);
+  const m = re.exec(html);
+  if (m) {
+    const near = html.slice(Math.max(0, start), m.index);
+    actions.push({
+      serverScreenUpdate: decodeJsString(m[1]),
+      inputFieldIds: near.includes('"id":"rendezvousCode"') ? ['rendezvousCode'] : [],
+      label: 'Continue',
+    });
+  }
+  return {
+    serverState: decodeJsString(state),
+    viewName: html.match(/"loggingViewName":"([^"]+)"/)?.[1] || '',
+    screenName: '',
+    texts: [],
+    actions,
+  };
+}
+
+function screenSummary(s: ClcsScreen): string {
+  return `${s.screenName || s.viewName || 'unknown screen'}${s.texts[0] ? ` "${s.texts[0].slice(0, 60)}"` : ''}`;
+}
+
+const SUCCESS_TEXT = /all set|you('|’)re (now )?(signed|connected)|connected|signed in|success|enjoy|ready to watch/i;
+const SUCCESS_SCREEN = /success|complete|confirmation|connected|done/i;
+const LOGIN_SCREEN = /login|password|email|signin|sign_in/i;
+
+async function submitCodeViaClcs(
+  html: string,
+  code: string,
+  headers: Record<string, string>,
+  cookieHeader: () => string,
+  absorb: (res: Response) => void,
+  pageUrl: string
+): Promise<{ ok: boolean; outcome: TvPairOutcome; detail: string; netflixMessage?: string }> {
+  let screen = clcsScreenFromHtml(html);
+  if (!screen || screen.actions.length === 0) {
+    return { ok: false, outcome: 'unknown', detail: 'New Netflix code page: could not find the Continue action' };
+  }
+  let action = screen.actions.find((a) => a.inputFieldIds.includes('rendezvousCode')) || screen.actions[0];
+  const steps: string[] = [];
+
+  for (let step = 0; step < MAX_CLCS_STEPS; step++) {
+    const res = await fetch(GRAPHQL_URL, {
+      method: 'POST',
+      headers: {
+        ...headers,
+        Cookie: cookieHeader(),
+        'Content-Type': 'application/json',
+        Accept: '*/*',
+        Origin: 'https://www.netflix.com',
+        Referer: pageUrl,
+        'x-netflix.context.operation-name': 'CLCSScreenUpdate',
+        'x-netflix.request.clcs.bucket': 'high',
+      },
+      body: JSON.stringify({
+        operationName: 'CLCSScreenUpdate',
+        variables: {
+          format: 'HTML',
+          imageFormat: 'PNG',
+          locale: 'en-US',
+          serverState: screen.serverState,
+          serverScreenUpdate: action.serverScreenUpdate,
+          inputFields: action.inputFieldIds.includes('rendezvousCode')
+            ? [{ name: 'rendezvousCode', value: { stringValue: code } }]
+            : [],
+        },
+        extensions: { persistedQuery: { id: CLCS_SCREEN_UPDATE_ID, version: 102 } },
+      }),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15000),
+      cache: 'no-store',
+    });
+    absorb(res);
+
+    if (isLoginRedirect(res)) {
+      return { ok: false, outcome: 'session_expired', detail: 'Netflix sent the code submission to login: account cookies are logged out' };
+    }
+    if (res.status !== 200) {
+      return {
+        ok: false,
+        outcome: res.status === 403 || res.status === 429 ? 'blocked' : 'unknown',
+        detail: `Netflix API answered HTTP ${res.status}${steps.length ? ` after ${steps.join(' > ')}` : ''}`,
+      };
+    }
+
+    const json: any = await res.json().catch(() => null);
+    if (json?.errors?.length) {
+      return { ok: false, outcome: 'unknown', detail: `Netflix API error: ${String(json.errors[0]?.message || 'unknown').slice(0, 120)}` };
+    }
+    const result = json?.data?.result;
+    const outcomeType = String(result?.__typename || result?.outcomeType || 'none');
+
+    if (!result?.screen) {
+      // Navigation away from the code flow (e.g. to /browse) means Netflix is done.
+      const text = JSON.stringify(result || {});
+      if (/browse|success|complete/i.test(text)) {
+        return { ok: true, outcome: 'success', detail: `Netflix accepted the code (${outcomeType})` };
+      }
+      return { ok: false, outcome: 'unknown', detail: `Netflix answered ${outcomeType} with no screen` };
+    }
+
+    screen = readClcsScreen(result.screen);
+    steps.push(screenSummary(screen));
+
+    if (screen.codeError) {
+      return { ok: false, outcome: 'invalid_code', detail: 'Netflix rejected the code', netflixMessage: screen.codeError };
+    }
+    if (LOGIN_SCREEN.test(screen.screenName) && !/rendezvous/i.test(screen.screenName)) {
+      return { ok: false, outcome: 'session_expired', detail: `Netflix asked to sign in (${screenSummary(screen)}): account cookies are logged out` };
+    }
+    if (SUCCESS_SCREEN.test(screen.screenName) || SUCCESS_SCREEN.test(screen.viewName) || screen.texts.some((t) => SUCCESS_TEXT.test(t))) {
+      return { ok: true, outcome: 'success', detail: `Netflix accepted the code (${screenSummary(screen)})` };
+    }
+
+    // A follow-up confirmation (e.g. "Continue" on a confirm screen): press it.
+    const next =
+      screen.actions.find((a) => a.inputFieldIds.length === 0 && /continue|confirm|yes|next|done|ok/i.test(a.label)) ||
+      screen.actions.find((a) => a.inputFieldIds.includes('rendezvousCode'));
+    if (!next) break;
+    action = next;
+  }
+
+  return { ok: false, outcome: 'unknown', detail: `Netflix showed: ${steps.join(' > ') || 'no screen'}` };
+}
+
 export async function confirmTvCode(account: NetflixAccount, rawCode: string): Promise<TvPairResult> {
   const code = rawCode.replace(/[^0-9A-Za-z]/g, '').toUpperCase();
   let cookies = account.cookies || [];
@@ -202,7 +401,7 @@ export async function confirmTvCode(account: NetflixAccount, rawCode: string): P
       }
 
       authURL = findAuthURL(html);
-      if (authURL) {
+      if (authURL || isClcsPage(html)) {
         pageUrl = attempt.url;
         authCookiesOnly = attempt.jar === 'auth';
         break;
@@ -216,13 +415,53 @@ export async function confirmTvCode(account: NetflixAccount, rawCode: string): P
       );
     }
 
-    if (!authURL) {
+    if (!authURL && !isClcsPage(html)) {
       const detail = `Netflix code page had no authURL. ${notes.join(' | ')}`.slice(0, 600);
       console.warn('[tv-login] no authURL', { account: account.id, notes });
       return result(false, notes.some((n) => /bot check|HTTP 403|HTTP 429/.test(n)) ? 'blocked' : 'unknown', detail);
     }
 
-    // 2. Submit the code exactly as the website form does
+    // Netflix randomly serves the old form or the new screen. The old form's
+    // POST now answers with the new screen instead of a result, so reload a
+    // few times to get the new screen and use its API.
+    for (let retry = 0; retry < 4 && !isClcsPage(html); retry++) {
+      const again = await fetch(pageUrl, {
+        headers: {
+          ...baseHeaders,
+          Cookie: buildCookieHeader(authCookiesOnly ? cookies.filter((c) => /^(Secure)?NetflixId$/.test(c.name)) : cookies),
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Upgrade-Insecure-Requests': '1',
+        },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(12000),
+        cache: 'no-store',
+      });
+      absorb(again);
+      if (again.status !== 200) break;
+      const text = await again.text();
+      if (isClcsPage(text)) html = text;
+    }
+
+    // 2a. New Netflix page: send the code through its GraphQL screen API.
+    if (isClcsPage(html)) {
+      const clcs = await submitCodeViaClcs(
+        html,
+        code,
+        baseHeaders,
+        () => buildCookieHeader(authCookiesOnly ? cookies.filter((c) => /^(Secure)?NetflixId$/.test(c.name)) : cookies),
+        absorb,
+        pageUrl
+      );
+      return result(clcs.ok, clcs.outcome, clcs.detail, clcs.netflixMessage);
+    }
+
+    // 2b. Classic page: submit the code exactly as the website form does
+    if (!authURL) {
+      return result(false, 'unknown', `Netflix code page had no authURL (${describePage(html, new URL(pageUrl).pathname)})`);
+    }
     const form = new URLSearchParams({
       flow: hiddenInput(html, 'flow') || 'websiteSignUp',
       authURL,
@@ -269,6 +508,17 @@ export async function confirmTvCode(account: NetflixAccount, rawCode: string): P
     }
 
     const body = await submit.text();
+    if (submit.status === 200 && isClcsPage(body)) {
+      const clcs = await submitCodeViaClcs(
+        body,
+        code,
+        baseHeaders,
+        () => buildCookieHeader(cookies),
+        absorb,
+        pageUrl
+      );
+      return result(clcs.ok, clcs.outcome, `${clcs.detail} (after classic form)`, clcs.netflixMessage);
+    }
     const mode = pageMode(body);
     const message = errorText(body);
 
@@ -280,7 +530,7 @@ export async function confirmTvCode(account: NetflixAccount, rawCode: string): P
     if (submit.status === 200 && mode === CODE_MODE) {
       return result(false, 'invalid_code', 'Netflix rejected the code (still on the code page)', message);
     }
-    return result(false, submit.status === 403 || submit.status === 429 ? 'blocked' : 'unknown', `Netflix answered HTTP ${submit.status} (mode=${mode || 'none'})`, message);
+    return result(false, submit.status === 403 || submit.status === 429 ? 'blocked' : 'unknown', `Netflix answered HTTP ${submit.status} (mode=${mode || 'none'}; ${describePage(body, 'code submit')})`, message);
   } catch (err: any) {
     const timeout = err?.name === 'TimeoutError' || err?.name === 'AbortError';
     return result(false, 'blocked', timeout ? 'Netflix did not respond in time' : `Could not reach Netflix: ${err?.message || 'network error'}`);
